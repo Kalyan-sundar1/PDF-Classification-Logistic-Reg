@@ -1,18 +1,20 @@
 import os
-import pdfplumber
+import re
 import joblib
+import pdfplumber
 import pandas as pd
 import numpy as np
 
+from sklearn.pipeline import Pipeline
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report
+from sklearn.model_selection import train_test_split, cross_val_score
+from sklearn.metrics import classification_report, confusion_matrix
 
 
-# -----------------------------
-# PDF TEXT EXTRACTION FUNCTION
-# -----------------------------
+
+# PDF TEXT EXTRACTION
+
 def extract_text(pdf_path):
     text = ""
     with pdfplumber.open(pdf_path) as pdf:
@@ -21,9 +23,21 @@ def extract_text(pdf_path):
     return text
 
 
-# -----------------------------
+
+# TEXT CLEANING & NORMALIZATION
+
+def clean_text(text):
+    text = text.lower()
+    text = re.sub(r'\n', ' ', text)
+    text = re.sub(r'\d+', ' ', text)
+    text = re.sub(r'[^a-z\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+
 # DATA CONFIG
-# -----------------------------
+
 BASE_DIR = "data"
 
 label_map = {
@@ -36,9 +50,9 @@ label_map = {
 }
 
 
-# -----------------------------
+
 # LOAD DATA
-# -----------------------------
+
 texts = []
 labels = []
 
@@ -51,58 +65,94 @@ for folder, label in label_map.items():
     for file in os.listdir(folder_path):
         if file.endswith(".pdf"):
             pdf_path = os.path.join(folder_path, file)
-            texts.append(extract_text(pdf_path))
+            raw_text = extract_text(pdf_path)
+            cleaned_text = clean_text(raw_text)
+
+            texts.append(cleaned_text)
             labels.append(label)
 
 df = pd.DataFrame({"text": texts, "label": labels})
 
-print("📊 Class distribution:")
+print("\n📊 Original class distribution:")
 print(df["label"].value_counts())
 
 
-# -----------------------------
-# VECTORIZE TEXT
-# -----------------------------
-vectorizer = TfidfVectorizer(
-    stop_words="english",
-    max_features=5000
-)
 
-X = vectorizer.fit_transform(df["text"])
-y = df["label"]
+# FIX 1: REMOVE RARE CLASSES
+
+MIN_SAMPLES = 2
+
+class_counts = df["label"].value_counts()
+valid_classes = class_counts[class_counts >= MIN_SAMPLES].index
+
+removed_classes = class_counts[class_counts < MIN_SAMPLES]
+
+if len(removed_classes) > 0:
+    print("\n⚠️ Removing rare classes (too few samples):")
+    print(removed_classes)
+
+df = df[df["label"].isin(valid_classes)]
+
+print("\n✅ Class distribution after filtering:")
+print(df["label"].value_counts())
 
 
-# -----------------------------
-# TRAIN TEST SPLIT
-# -----------------------------
+
+# TRAIN / TEST SPLIT (SAFE)
+
 X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
+    df["text"],
+    df["label"],
     test_size=0.2,
-    random_state=42
+    random_state=42,
+    stratify=df["label"]
 )
 
 
-# -----------------------------
+
+# PIPELINE (TF-IDF + LOGISTIC)
+
+pipeline = Pipeline([
+    ("tfidf", TfidfVectorizer(
+        stop_words="english",
+        max_features=8000,
+        ngram_range=(1, 2)
+    )),
+    ("clf", LogisticRegression(
+        max_iter=3000,
+        solver="saga",
+        class_weight="balanced",
+        n_jobs=-1
+    ))
+])
+
+
+
+# CROSS-VALIDATION
+
+cv_scores = cross_val_score(
+    pipeline,
+    df["text"],
+    df["label"],
+    cv=5,
+    scoring="f1_macro"
+)
+
+print("\n📈 Cross-Validation F1 Scores:", cv_scores)
+print("📈 Mean F1 Score:", cv_scores.mean())
+
+
+
 # TRAIN MODEL
-# -----------------------------
-model = LogisticRegression(
-    max_iter=2000,
-    solver="saga"
-)
 
-model.fit(X_train, y_train)
+pipeline.fit(X_train, y_train)
 
 
-# -----------------------------
-# PREDICTION
-# -----------------------------
-y_pred = model.predict(X_test)
 
+# EVALUATION
 
-# -----------------------------
-# CLASSIFICATION REPORT (FIXED)
-# -----------------------------
+y_pred = pipeline.predict(X_test)
+
 labels_present = np.unique(y_test)
 target_names = [k for k, v in label_map.items() if v in labels_present]
 
@@ -115,11 +165,12 @@ print(classification_report(
     zero_division=0
 ))
 
+print("\n📊 Confusion Matrix:")
+print(confusion_matrix(y_test, y_pred))
 
-# -----------------------------
-# SAVE MODEL & VECTORIZER
-# -----------------------------
-joblib.dump(model, "document_model.pkl")
-joblib.dump(vectorizer, "tfidf_vectorizer.pkl")
 
-print("\n✅ Model and vectorizer saved successfully")
+
+# SAVE PIPELINE
+
+joblib.dump(pipeline, "document_classifier_pipeline.pkl")
+print("\n✅ Model saved as document_classifier_pipeline.pkl")
